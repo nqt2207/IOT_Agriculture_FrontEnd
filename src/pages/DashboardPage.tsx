@@ -253,23 +253,6 @@ function DashboardPage() {
 
   /*
    * =========================
-   * FORMAT VALUE
-   * =========================
-   */
-
-  const formatValue = (
-    item: TelemetryItem | null,
-    unit: string,
-  ) => {
-    if (!item) {
-      return '--';
-    }
-
-    return `${item.value} ${unit}`;
-  };
-
-  /*
-   * =========================
    * FORMAT TANK
    * =========================
    */

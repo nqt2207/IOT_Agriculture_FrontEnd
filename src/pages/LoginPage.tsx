@@ -1,4 +1,5 @@
-import { FormEvent, useState } from 'react';
+import { useState } from 'react';
+import type { SubmitEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import '../App.css';
 import api from '../services/api';
@@ -12,7 +13,7 @@ function LoginPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  const handleLogin = async (event: FormEvent<HTMLFormElement>) => {
+  const handleLogin = async (event: SubmitEvent<HTMLFormElement>) => {
     event.preventDefault();
 
     setError('');
