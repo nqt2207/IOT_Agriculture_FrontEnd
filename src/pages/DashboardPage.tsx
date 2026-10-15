@@ -22,6 +22,7 @@ import {
 } from 'recharts';
 
 import api from '../services/api';
+import { io } from 'socket.io-client';
 
 interface TelemetryItem {
   sensor: string;
@@ -30,6 +31,14 @@ interface TelemetryItem {
   zoneId: number;
   bbbId: string;
   esp32Id: string;
+}
+
+interface TelemetryUpdate {
+  bbbId: string;
+  zoneId: string | number;
+  esp32Id: string;
+  timestamp: string;
+  sensors: Record<string, number>;
 }
 
 type SensorType =
@@ -145,6 +154,75 @@ function DashboardPage() {
 
     fetchTelemetry();
   }, [zoneId, navigate]);
+
+  
+  useEffect(() => {
+    if (!zoneId) return;
+
+    const socketUrl =
+      import.meta.env.VITE_WS_URL ||
+      'http://localhost:3000';
+
+    const socket = io(socketUrl, {
+      transports: ['websocket'],
+    });
+
+    socket.on('connect', () => {
+      console.log('WebSocket connected:', socket.id);
+    });
+
+    socket.on('connect_error', (error) => {
+      console.error(
+        'WebSocket connection error:',
+        error.message,
+      );
+    });
+
+    socket.on(
+      'telemetry:update',
+      (update: TelemetryUpdate) => {
+        console.log('[WS] Received telemetry:', update);
+        // Chỉ xử lý dữ liệu của zone đang mở.
+        if (Number(update.zoneId) !== Number(zoneId)) {
+          return;
+        }
+
+        const newItems: TelemetryItem[] = Object.entries(
+          update.sensors,
+        ).map(([sensor, value]) => ({
+          sensor,
+          value,
+          timestamp: update.timestamp,
+          zoneId: Number(update.zoneId),
+          bbbId: update.bbbId,
+          esp32Id: update.esp32Id,
+        }));
+
+        setTelemetry((previous) => {
+          const existingKeys = new Set(
+            previous.map(
+              (item) =>
+                `${item.sensor}|${item.timestamp}|${item.bbbId}|${item.esp32Id}`,
+            ),
+          );
+
+          const uniqueItems = newItems.filter(
+            (item) =>
+              !existingKeys.has(
+                `${item.sensor}|${item.timestamp}|${item.bbbId}|${item.esp32Id}`,
+              ),
+          );
+
+          return [...previous, ...uniqueItems];
+        });
+      },
+    );
+
+    return () => {
+      socket.disconnect();
+    };
+  }, [zoneId]);
+
 
   /*
    * =========================
