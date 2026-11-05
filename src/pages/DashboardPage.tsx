@@ -1,12 +1,11 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
+import ActuatorHistory from '../components/ActuatorHistory';
 import {
   ArrowLeft,
   Droplets,
-  Fan,
   Gauge,
-  Lightbulb,
   Power,
   X,
   Sprout,
@@ -16,6 +15,7 @@ import {
 } from 'lucide-react';
 
 import AppHeader from '../components/AppHeader';
+
 import {
   CartesianGrid,
   Line,
@@ -28,6 +28,10 @@ import {
 
 import api from '../services/api';
 import { io } from 'socket.io-client';
+
+// =========================
+// INTERFACES
+// =========================
 
 interface TelemetryItem {
   sensor: string;
@@ -46,6 +50,23 @@ interface TelemetryUpdate {
   sensors: Record<string, number>;
 }
 
+interface ApiActuator {
+  actuator_id: number;
+  farm_id: number;
+  farm_name?: string;
+  bbb_id: string;
+  esp32_id: string;
+  scope: string;
+  zone_id: number | null;
+  actuator: string;
+  type: string;
+  control_mode: string;
+  reported_control_mode: string | null;
+  desired_state: boolean;
+  actual_state: boolean | null;
+  state_updated_at: string | null;
+}
+
 type SensorType =
   | 'temperature'
   | 'humidity'
@@ -55,25 +76,17 @@ type SensorType =
   | 'water_volume';
 
 type Period = 1 | 7 | 30;
-type ActuatorId = 'fan' | 'light' | 'pump1';
 
 type ActuatorMode = 'AUTO' | 'MANUAL';
 
-interface ActuatorStateMessage {
-  device_id: string;
-  simulation: boolean;
-  actuators: {
-    pump1: 0 | 1;
-    fan: 0 | 1;
-    light: 0 | 1;
-  };
-}
-
 interface Actuator {
-  id: ActuatorId;
+  actuatorId: number;
+  esp32Id: string;
+  id: 'pump1';
   label: string;
   description: string;
-  state: boolean;
+  state: boolean | null;
+  desiredState: boolean;
   mode: ActuatorMode;
 }
 
@@ -83,32 +96,41 @@ interface SensorConfig {
   icon: React.ReactNode;
 }
 
+// =========================
+// SENSOR CONFIG
+// =========================
+
 const sensorConfig: Record<SensorType, SensorConfig> = {
   temperature: {
     label: 'Temperature',
     unit: '°C',
     icon: <Thermometer size={22} />,
   },
+
   humidity: {
     label: 'Humidity',
     unit: '%',
     icon: <Droplets size={22} />,
   },
+
   soil_moisture: {
     label: 'Soil Moisture',
     unit: '%',
     icon: <Sprout size={22} />,
   },
+
   light: {
     label: 'Light',
     unit: 'lux',
     icon: <Sun size={22} />,
   },
+
   water_flow: {
     label: 'Water Flow',
     unit: 'L/min',
     icon: <Waves size={22} />,
   },
+
   water_volume: {
     label: 'Water Volume',
     unit: 'L',
@@ -116,26 +138,53 @@ const sensorConfig: Record<SensorType, SensorConfig> = {
   },
 };
 
+// =========================
+// COMPONENT
+// =========================
+
 function DashboardPage() {
   const navigate = useNavigate();
   const { zoneId } = useParams();
 
+  // =========================
+  // TELEMETRY STATE
+  // =========================
+
   const [telemetry, setTelemetry] = useState<TelemetryItem[]>([]);
+
   const [selectedSensor, setSelectedSensor] =
     useState<SensorType | null>(null);
+
   const [period, setPeriod] = useState<Period>(1);
+
   const [loading, setLoading] = useState(true);
+
   const [error, setError] = useState('');
 
-  // Ref trỏ đến phần biểu đồ lịch sử.
   const historyRef = useRef<HTMLElement | null>(null);
 
-  /*
-   * AUTO SCROLL TO HISTORY CHART
-   *
-   * Khi chọn cảm biến, đợi React render biểu đồ xong
-   * rồi cuộn trang xuống phần biểu đồ.
-   */
+  // =========================
+  // ACTUATOR STATE
+  // =========================
+
+  const [actuator, setActuator] = useState<Actuator | null>(null);
+
+  const [actuatorLoading, setActuatorLoading] = useState(false);
+
+  const [actuatorError, setActuatorError] = useState('');
+
+  const [actuatorMessage, setActuatorMessage] = useState('');
+
+  const [pendingActuator, setPendingActuator] =
+    useState<'pump1' | null>(null);
+
+  const [actuatorStateReceived, setActuatorStateReceived] =
+    useState(false);
+
+  // =========================
+  // AUTO SCROLL TO HISTORY
+  // =========================
+
   useEffect(() => {
     if (!selectedSensor) return;
 
@@ -151,50 +200,19 @@ function DashboardPage() {
     };
   }, [selectedSensor]);
 
-  // Trạng thái ban đầu: chờ nhận dữ liệu từ BBB qua WebSocket.
-  const [actuators, setActuators] = useState<Actuator[]>([
-    {
-      id: 'fan',
-      label: 'Fan',
-      description: 'Air temperature control',
-      state: false,
-      mode: 'AUTO',
-    },
-    {
-      id: 'light',
-      label: 'Light',
-      description: 'Supplementary lighting',
-      state: false,
-      mode: 'AUTO',
-    },
-    {
-      id: 'pump1',
-      label: 'Pump',
-      description: 'Irrigation water supply',
-      state: false,
-      mode: 'AUTO',
-    },
-  ]);
+  // =========================
+  // FETCH ACTUATOR STATE
+  // =========================
 
-  const [pendingActuator, setPendingActuator] =
-    useState<ActuatorId | null>(null);
-
-  const [actuatorLoading, setActuatorLoading] = useState(false);
-  const [actuatorError, setActuatorError] = useState('');
-  const [actuatorStateReceived, setActuatorStateReceived] =
-    useState(false);
-
-    /*
-  * FETCH INITIAL ACTUATOR STATE
-  *
-  * Lấy trạng thái hiện tại của thiết bị từ backend
-  * mỗi khi Dashboard được mở hoặc tải lại.
-  */
   useEffect(() => {
     let cancelled = false;
 
     const fetchActuatorState = async () => {
+      if (!zoneId) return;
+
       try {
+        setActuatorError('');
+
         const token = localStorage.getItem('accessToken');
 
         if (!token) {
@@ -208,66 +226,76 @@ function DashboardPage() {
           },
         });
 
-        // Hỗ trợ cả response được bọc trong data
-        // và response trả về trực tiếp.
         const result = response.data?.data ?? response.data;
 
-        if (
-          !result?.actuators ||
-          cancelled
-        ) {
-          console.warn(
-            'API không trả về trạng thái thiết bị hợp lệ:',
-            response.data,
-          );
-          return;
-        }
+        const allActuators: ApiActuator[] =
+          Array.isArray(result?.actuators)
+            ? result.actuators
+            : [];
 
-        const receivedActuators = result.actuators;
-
-        // Chỉ chấp nhận trạng thái 0 hoặc 1.
-        const validState = (
-          value: unknown,
-        ): value is 0 | 1 => value === 0 || value === 1;
-
-        if (
-          !validState(receivedActuators.pump1) ||
-          !validState(receivedActuators.fan) ||
-          !validState(receivedActuators.light)
-        ) {
-          console.warn(
-            'Trạng thái thiết bị không hợp lệ:',
-            receivedActuators,
-          );
-          return;
-        }
-
-        setActuators((previous) =>
-          previous.map((actuator) => {
-            const value = receivedActuators[actuator.id];
-
-            return {
-              ...actuator,
-              state: value === 1,
-            };
-          }),
+        // Find pump assigned to the current zone.
+        const pump = allActuators.find(
+          (item) =>
+            Number(item.zone_id) === Number(zoneId) &&
+            item.scope === 'zone' &&
+            item.actuator === 'pump1',
         );
+
+        if (cancelled) return;
+
+        if (!pump) {
+          setActuator(null);
+          setActuatorStateReceived(false);
+
+          console.warn(
+            'No pump found for zone:',
+            zoneId,
+            allActuators,
+          );
+
+          return;
+        }
+
+        const reportedMode =
+          pump.reported_control_mode ?? pump.control_mode;
+
+        setActuator({
+          actuatorId: pump.actuator_id,
+          esp32Id: pump.esp32_id,
+          id: 'pump1',
+          label: 'Pump',
+          description: 'Irrigation water supply',
+          state: pump.actual_state,
+          desiredState: pump.desired_state,
+          mode:
+            reportedMode?.toLowerCase() === 'manual'
+              ? 'MANUAL'
+              : 'AUTO',
+        });
 
         setActuatorStateReceived(true);
 
         console.log(
-          'Initial actuator state loaded from API:',
-          result,
+          'Pump state loaded:',
+          pump,
         );
       } catch (err: any) {
         console.error(
-          'Failed to fetch initial actuator state:',
+          'Failed to fetch pump state:',
           err,
         );
 
         if (err?.response?.status === 401) {
           localStorage.removeItem('accessToken');
           navigate('/login');
+          return;
+        }
+
+        if (!cancelled) {
+          setActuatorError(
+            err?.response?.data?.message ||
+              'Unable to load pump state.',
+          );
         }
       }
     };
@@ -277,12 +305,15 @@ function DashboardPage() {
     return () => {
       cancelled = true;
     };
-  }, [navigate]);
+  }, [zoneId, navigate]);
 
-  /*
-   * FETCH TELEMETRY
-   */
+  // =========================
+  // FETCH TELEMETRY
+  // =========================
+
   useEffect(() => {
+    let cancelled = false;
+
     const fetchTelemetry = async () => {
       try {
         setLoading(true);
@@ -291,6 +322,7 @@ function DashboardPage() {
         const token = localStorage.getItem('accessToken');
 
         if (!token) {
+          localStorage.removeItem('accessToken');
           navigate('/login');
           return;
         }
@@ -304,9 +336,16 @@ function DashboardPage() {
           },
         );
 
-        setTelemetry(response.data?.data ?? []);
+        const result = response.data?.data ?? response.data;
+
+        if (!cancelled) {
+          setTelemetry(Array.isArray(result) ? result : []);
+        }
       } catch (err: any) {
-        console.error('Failed to fetch telemetry:', err);
+        console.error(
+          'Failed to fetch telemetry:',
+          err,
+        );
 
         if (err?.response?.status === 401) {
           localStorage.removeItem('accessToken');
@@ -314,18 +353,29 @@ function DashboardPage() {
           return;
         }
 
-        setError('Failed to load telemetry data.');
+        if (!cancelled) {
+          setError('Failed to load telemetry data.');
+        }
       } finally {
-        setLoading(false);
+        if (!cancelled) {
+          setLoading(false);
+        }
       }
     };
 
-    fetchTelemetry();
+    if (zoneId) {
+      fetchTelemetry();
+    }
+
+    return () => {
+      cancelled = true;
+    };
   }, [zoneId, navigate]);
 
-  /*
-   * WEBSOCKET TELEMETRY
-   */
+  // =========================
+  // WEBSOCKET TELEMETRY
+  // =========================
+
   useEffect(() => {
     if (!zoneId) return;
 
@@ -338,7 +388,10 @@ function DashboardPage() {
     });
 
     socket.on('connect', () => {
-      console.log('WebSocket connected:', socket.id);
+      console.log(
+        'WebSocket connected:',
+        socket.id,
+      );
     });
 
     socket.on('connect_error', (socketError) => {
@@ -351,7 +404,9 @@ function DashboardPage() {
     socket.on(
       'telemetry:update',
       (update: TelemetryUpdate) => {
-        if (Number(update.zoneId) !== Number(zoneId)) {
+        if (
+          Number(update.zoneId) !== Number(zoneId)
+        ) {
           return;
         }
 
@@ -386,47 +441,15 @@ function DashboardPage() {
       },
     );
 
-    socket.on(
-      'actuator:state',
-      (data: ActuatorStateMessage) => {
-        if (data.device_id !== 'BBB_01') {
-          return;
-        }
-
-        const receivedActuators = data.actuators;
-
-        setActuators((previous) =>
-          previous.map((actuator) => {
-            const value = receivedActuators[actuator.id];
-
-            if (value !== 0 && value !== 1) {
-              return actuator;
-            }
-
-            return {
-              ...actuator,
-              state: value === 1,
-            };
-          }),
-        );
-
-        setActuatorStateReceived(true);
-
-        console.log(
-          'Actuator state received:',
-          data,
-        );
-      },
-    );
-
     return () => {
       socket.disconnect();
     };
   }, [zoneId]);
 
-  /*
-   * GET LATEST SENSOR VALUE
-   */
+  // =========================
+  // GET LATEST SENSOR VALUE
+  // =========================
+
   const getLatestValue = (sensor: string) => {
     const items = telemetry
       .filter((item) => item.sensor === sensor)
@@ -440,16 +463,23 @@ function DashboardPage() {
   };
 
   const latestTemperature = getLatestValue('temperature');
+
   const latestHumidity = getLatestValue('humidity');
+
   const latestSoilMoisture = getLatestValue('soil_moisture');
+
   const latestLight = getLatestValue('light');
+
   const latestTankStatus = getLatestValue('tank_status');
+
   const latestWaterFlow = getLatestValue('water_flow');
+
   const latestWaterVolume = getLatestValue('water_volume');
 
-  /*
-   * FILTER HISTORY BY PERIOD
-   */
+  // =========================
+  // FILTER HISTORY
+  // =========================
+
   const filteredTelemetry = useMemo(() => {
     if (!selectedSensor) return [];
 
@@ -469,9 +499,10 @@ function DashboardPage() {
       );
   }, [telemetry, selectedSensor, period]);
 
-  /*
-   * CHART DATA
-   */
+  // =========================
+  // CHART DATA
+  // =========================
+
   const chartData = useMemo(
     () =>
       filteredTelemetry.map((item) => ({
@@ -490,129 +521,111 @@ function DashboardPage() {
     [filteredTelemetry],
   );
 
-  /*
-   * SENSOR CLICK
-   */
+  // =========================
+  // SENSOR CLICK
+  // =========================
+
   const handleSensorClick = (sensor: SensorType) => {
     setSelectedSensor((current) =>
       current === sensor ? null : sensor,
     );
   };
 
-  /*
-   /*
- * ACTUATOR CONTROL
- */
+  // =========================
+  // ACTUATOR CONTROL
+  // =========================
 
-const actuatorToConfirm = actuators.find(
-  (actuator) => actuator.id === pendingActuator,
-);
+  const requestActuatorToggle = () => {
+    if (!actuator) return;
 
-const requestActuatorToggle = (
-  actuatorId: ActuatorId,
-) => {
-  setActuatorError('');
-  setPendingActuator(actuatorId);
-};
-
-const confirmActuatorToggle = async () => {
-  if (!pendingActuator || actuatorLoading) {
-    return;
-  }
-
-  const actuator = actuators.find(
-    (item) => item.id === pendingActuator,
-  );
-
-  if (!actuator) {
-    return;
-  }
-
-  const nextValue = actuator.state ? 0 : 1;
-
-  try {
-    setActuatorLoading(true);
     setActuatorError('');
+    setActuatorMessage('');
+    setPendingActuator('pump1');
+  };
 
-    const token = localStorage.getItem('accessToken');
-
-    if (!token) {
-      navigate('/login');
+  const confirmActuatorToggle = async () => {
+    if (
+      !pendingActuator ||
+      !actuator ||
+      actuatorLoading
+    ) {
       return;
     }
 
-    const response = await api.post(
-      '/bbb/actuators/control',
-      {
-        actuator: pendingActuator,
-        state: nextValue,
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${token}`,
+    const currentState =
+      actuator.state ?? actuator.desiredState;
+
+    const nextValue = currentState ? 0 : 1;
+
+    try {
+      setActuatorLoading(true);
+      setActuatorError('');
+      setActuatorMessage('');
+
+      const token = localStorage.getItem('accessToken');
+
+      if (!token) {
+        navigate('/login');
+        return;
+      }
+
+      const response = await api.post(
+        '/bbb/actuators/control',
+        {
+          esp32_id: actuator.esp32Id,
+          actuator: 'pump1',
+          state: nextValue,
         },
-      },
-    );
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        },
+      );
 
-    console.log(
-      'Actuator command accepted by backend:',
-      response.data,
-    );
+      console.log(
+        'Pump command accepted by backend:',
+        response.data,
+      );
 
-    // Không tự đổi state tại đây.
-    // Chờ BBB phản hồi qua WebSocket actuator:state.
-    setActuators((previous) =>
-      previous.map((item) =>
-        item.id === pendingActuator
-          ? {
-              ...item,
-              mode: 'MANUAL',
-            }
-          : item,
-      ),
-    );
+      setActuatorMessage(
+        'Command sent successfully. Waiting for device feedback.',
+      );
 
-    setPendingActuator(null);
-  } catch (err: any) {
-    console.error(
-      'Failed to control actuator:',
-      err,
-    );
+      setPendingActuator(null);
+    } catch (err: any) {
+      console.error(
+        'Failed to control pump:',
+        err,
+      );
 
-    if (err?.response?.status === 401) {
-      localStorage.removeItem('accessToken');
-      navigate('/login');
-      return;
+      if (err?.response?.status === 401) {
+        localStorage.removeItem('accessToken');
+        navigate('/login');
+        return;
+      }
+
+      setActuatorError(
+        err?.response?.data?.message ||
+          'Failed to send pump command. Please try again.',
+      );
+    } finally {
+      setActuatorLoading(false);
     }
+  };
 
-    setActuatorError(
-      err?.response?.data?.message ||
-        'Failed to send actuator command. Please try again.',
-    );
-  } finally {
-    setActuatorLoading(false);
-  }
-};
+  // =========================
+  // BACK
+  // =========================
 
-const setActuatorAuto = (actuatorId: ActuatorId) => {
-  // Hiện tại backend mới có API bật/tắt thiết bị.
-  // Chưa có lệnh MQTT riêng để chuyển thiết bị về AUTO.
-  // Không giả vờ rằng BBB đã nhận được lệnh AUTO.
-  setActuatorError(
-    `Automatic mode for ${actuatorId} has not been connected to the backend yet.`,
-  );
-};
-
-  /*
-   * BACK
-   */
   const handleBack = () => {
     navigate(-1);
   };
 
-  /*
-   * TANK STATUS
-   */
+  // =========================
+  // TANK STATUS
+  // =========================
+
   const tankStatus =
     latestTankStatus?.value === 1
       ? 'Available'
@@ -620,9 +633,10 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
         ? 'Empty'
         : '--';
 
-  /*
-   * LOADING
-   */
+  // =========================
+  // LOADING
+  // =========================
+
   if (loading) {
     return (
       <div className="dashboard-loading">
@@ -632,14 +646,18 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
     );
   }
 
-  /*
-   * DASHBOARD
-   */
+  // =========================
+  // DASHBOARD
+  // =========================
+
   return (
     <div className="dashboard-page">
       <AppHeader />
 
       <div className="dashboard-container">
+
+        {/* HEADER */}
+
         <header className="dashboard-header">
           <button
             type="button"
@@ -673,6 +691,7 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
         )}
 
         {/* SENSOR CARDS */}
+
         <section className="sensor-section">
           <div className="section-heading">
             <div>
@@ -684,7 +703,9 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
           </div>
 
           <div className="sensor-grid">
+
             {/* TEMPERATURE */}
+
             <div
               className={`sensor-card ${
                 selectedSensor === 'temperature'
@@ -699,6 +720,7 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
                 <div className="sensor-icon temperature-icon">
                   <Thermometer size={22} />
                 </div>
+
                 <span className="sensor-status">Live</span>
               </div>
 
@@ -719,18 +741,22 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
             </div>
 
             {/* HUMIDITY */}
+
             <div
               className={`sensor-card ${
                 selectedSensor === 'humidity'
                   ? 'selected'
                   : ''
               }`}
-              onClick={() => handleSensorClick('humidity')}
+              onClick={() =>
+                handleSensorClick('humidity')
+              }
             >
               <div className="sensor-card-top">
                 <div className="sensor-icon humidity-icon">
                   <Droplets size={22} />
                 </div>
+
                 <span className="sensor-status">Live</span>
               </div>
 
@@ -751,6 +777,7 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
             </div>
 
             {/* SOIL MOISTURE */}
+
             <div
               className={`sensor-card ${
                 selectedSensor === 'soil_moisture'
@@ -765,6 +792,7 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
                 <div className="sensor-icon soil-icon">
                   <Sprout size={22} />
                 </div>
+
                 <span className="sensor-status">Live</span>
               </div>
 
@@ -785,25 +813,33 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
             </div>
 
             {/* LIGHT SENSOR */}
+
             <div
               className={`sensor-card ${
                 selectedSensor === 'light'
                   ? 'selected'
                   : ''
               }`}
-              onClick={() => handleSensorClick('light')}
+              onClick={() =>
+                handleSensorClick('light')
+              }
             >
               <div className="sensor-card-top">
                 <div className="sensor-icon light-icon">
                   <Sun size={22} />
                 </div>
+
                 <span className="sensor-status">Live</span>
               </div>
 
-              <div className="sensor-label">Light</div>
+              <div className="sensor-label">
+                Light
+              </div>
 
               <h2>
-                {latestLight ? latestLight.value : '--'}
+                {latestLight
+                  ? latestLight.value
+                  : '--'}
                 <span className="sensor-unit">lux</span>
               </h2>
 
@@ -813,11 +849,13 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
             </div>
 
             {/* WATER TANK */}
+
             <div className="sensor-card tank-card">
               <div className="sensor-card-top">
                 <div className="sensor-icon tank-icon">
                   <Droplets size={22} />
                 </div>
+
                 <span className="sensor-status">Status</span>
               </div>
 
@@ -835,6 +873,7 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
             </div>
 
             {/* WATER FLOW */}
+
             <div
               className={`sensor-card ${
                 selectedSensor === 'water_flow'
@@ -849,6 +888,7 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
                 <div className="sensor-icon flow-icon">
                   <Waves size={22} />
                 </div>
+
                 <span className="sensor-status">Live</span>
               </div>
 
@@ -869,6 +909,7 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
             </div>
 
             {/* WATER VOLUME */}
+
             <div
               className={`sensor-card ${
                 selectedSensor === 'water_volume'
@@ -883,6 +924,7 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
                 <div className="sensor-icon volume-icon">
                   <Gauge size={22} />
                 </div>
+
                 <span className="sensor-status">Live</span>
               </div>
 
@@ -901,24 +943,25 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
                 View history
               </span>
             </div>
+
           </div>
         </section>
 
-        {/* DEVICE CONTROL */}
+        {/* DEVICE CONTROL: PUMP ONLY */}
+
         <section className="actuator-section">
           <div className="section-heading">
             <div>
               <h2>Device Control</h2>
               <p>
-                Control actuators manually or return them
-                to automatic operation.
+                Control irrigation pump for this zone.
               </p>
             </div>
 
             <span className="actuator-demo-badge">
               {actuatorStateReceived
-                ? 'BBB connected · Simulation mode'
-                : 'Waiting for BBB state'}
+                ? 'Pump registered'
+                : 'Waiting for pump state'}
             </span>
           </div>
 
@@ -928,87 +971,111 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
             </div>
           )}
 
+          {actuatorMessage && (
+            <div className="page-success" role="status">
+              {actuatorMessage}
+            </div>
+          )}
+
           <div className="actuator-grid">
-            {actuators.map((actuator) => {
-              const Icon =
-                actuator.id === 'fan'
-                  ? Fan
-                  : actuator.id === 'light'
-                    ? Lightbulb
-                    : Droplets;
 
-              return (
-                <article
-                  className="actuator-card"
-                  key={actuator.id}
-                >
-                  <div className="actuator-card-top">
-                    <div
-                      className={`actuator-icon ${
-                        actuator.state ? 'is-on' : 'is-off'
-                      }`}
-                    >
-                      <Icon size={23} />
-                    </div>
-
-                    <span
-                      className={`actuator-state ${
-                        actuator.state ? 'is-on' : 'is-off'
-                      }`}
-                    >
-                      <span className="actuator-state-dot" />
-                      {actuator.state ? 'ON' : 'OFF'}
-                    </span>
+            {actuator ? (
+              <article className="actuator-card">
+                <div className="actuator-card-top">
+                  <div
+                    className={`actuator-icon ${
+                      actuator.state === true
+                        ? 'is-on'
+                        : 'is-off'
+                    }`}
+                  >
+                    <Droplets size={23} />
                   </div>
 
-                  <div className="actuator-card-body">
-                    <h3>{actuator.label}</h3>
-                    <p>{actuator.description}</p>
-                  </div>
+                  <span
+                    className={`actuator-state ${
+                      actuator.state === true
+                        ? 'is-on'
+                        : actuator.state === false
+                          ? 'is-off'
+                          : ''
+                    }`}
+                  >
+                    <span className="actuator-state-dot" />
 
-                  <div className="actuator-card-footer">
-                    <span
-                      className={`actuator-mode ${
-                        actuator.mode === 'MANUAL'
-                          ? 'manual'
-                          : 'auto'
-                      }`}
+                    {actuator.state === null
+                      ? 'UNKNOWN'
+                      : actuator.state
+                        ? 'ON'
+                        : 'OFF'}
+                  </span>
+                </div>
+
+                <div className="actuator-card-body">
+                  <h3>Pump</h3>
+
+                  <p>{actuator.description}</p>
+
+                  <p>
+                    <small>
+                      Device: {actuator.esp32Id}
+                    </small>
+                  </p>
+                </div>
+
+                <div className="actuator-card-footer">
+                  <span
+                    className={`actuator-mode ${
+                      actuator.mode === 'MANUAL'
+                        ? 'manual'
+                        : 'auto'
+                    }`}
+                  >
+                    {actuator.mode}
+                  </span>
+
+                  <div className="actuator-actions">
+                    <button
+                      type="button"
+                      className="actuator-toggle-button"
+                      onClick={requestActuatorToggle}
+                      disabled={actuatorLoading}
                     >
-                      {actuator.mode}
-                    </span>
+                      <Power size={16} />
 
-                    <div className="actuator-actions">
-                      <button
-                        type="button"
-                        className="actuator-toggle-button"
-                        onClick={() =>
-                          requestActuatorToggle(actuator.id)
-                        }
-                      >
-                        <Power size={16} />
-                        Turn {actuator.state ? 'off' : 'on'}
-                      </button>
-
-                      {actuator.mode === 'MANUAL' && (
-                        <button
-                          type="button"
-                          className="actuator-auto-button"
-                          onClick={() =>
-                            setActuatorAuto(actuator.id)
-                          }
-                        >
-                          Return to AUTO
-                        </button>
-                      )}
-                    </div>
+                      Turn{' '}
+                      {(actuator.state ??
+                        actuator.desiredState)
+                        ? 'off'
+                        : 'on'}
+                    </button>
                   </div>
-                </article>
-              );
-            })}
+                </div>
+              </article>
+            ) : (
+              <div className="empty-state">
+                <div className="empty-state-icon">
+                  <Droplets size={28} />
+                </div>
+
+                <h2>No pump found</h2>
+
+                <p>
+                  No pump is registered for this zone.
+                  Please check the device configuration.
+                </p>
+              </div>
+            )}
+
           </div>
         </section>
 
-        {/* HISTORY CHART */}
+        {/* ACTUATOR HISTORY */}
+
+        <ActuatorHistory zoneId={zoneId} />
+
+        {/* SENSOR HISTORY CHART */}
+
         {selectedSensor && (
           <section
             className="history-section"
@@ -1026,6 +1093,7 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
                       {sensorConfig[selectedSensor].label}
                       {' '}History
                     </h2>
+
                     <p>Historical sensor readings</p>
                   </div>
                 </div>
@@ -1068,7 +1136,9 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
               {chartData.length === 0 ? (
                 <div className="no-data">
                   <div>
-                    <p>No data available for this period.</p>
+                    <p>
+                      No data available for this period.
+                    </p>
                   </div>
                 </div>
               ) : (
@@ -1137,10 +1207,12 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
             </div>
           </section>
         )}
+
       </div>
 
-      {/* ACTUATOR CONFIRMATION MODAL */}
-      {actuatorToConfirm && (
+      {/* PUMP CONFIRMATION MODAL */}
+
+      {pendingActuator && actuator && (
         <div
           className="actuator-modal-backdrop"
           role="presentation"
@@ -1170,19 +1242,21 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
             </div>
 
             <h2 id="actuator-modal-title">
-              Confirm device control
+              Confirm pump control
             </h2>
 
             <p>
-              Do you want to turn{' '}
-              {actuatorToConfirm.label.toLowerCase()}{' '}
-              {actuatorToConfirm.state ? 'off' : 'on'}?
+              Do you want to turn the pump{' '}
+              {(actuator.state ?? actuator.desiredState)
+                ? 'off'
+                : 'on'}?
             </p>
 
             <p className="actuator-modal-note">
-              The command will be sent to the backend and forwarded
-              to BBB. The displayed device state will update when
-              the backend receives a state message from BBB.
+              The command will be sent to the backend
+              and forwarded to the corresponding ESP32.
+              The displayed state will update when
+              feedback is received.
             </p>
 
             <div className="actuator-modal-actions">
@@ -1190,6 +1264,7 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
                 type="button"
                 className="actuator-cancel-button"
                 onClick={() => setPendingActuator(null)}
+                disabled={actuatorLoading}
               >
                 Cancel
               </button>
@@ -1200,12 +1275,15 @@ const setActuatorAuto = (actuatorId: ActuatorId) => {
                 onClick={confirmActuatorToggle}
                 disabled={actuatorLoading}
               >
-                {actuatorLoading ? 'Sending...' : 'Confirm'}
+                {actuatorLoading
+                  ? 'Sending...'
+                  : 'Confirm'}
               </button>
             </div>
           </section>
         </div>
       )}
+
     </div>
   );
 }
