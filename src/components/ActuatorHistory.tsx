@@ -45,11 +45,6 @@ interface Pagination {
   totalPages: number;
 }
 
-interface ActuatorHistoryResponse {
-  items: ActuatorHistoryItem[];
-  pagination: Pagination;
-}
-
 interface ActuatorHistoryProps {
   farmId?: number | string;
   zoneId?: number | string;
