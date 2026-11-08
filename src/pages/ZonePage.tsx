@@ -12,10 +12,15 @@ import {
   useNavigate,
   useParams,
 } from 'react-router-dom';
+import { io } from 'socket.io-client';
 
 import api from '../services/api';
 import AppHeader from '../components/AppHeader';
 import ActuatorHistory from '../components/ActuatorHistory';
+
+// =========================
+// INTERFACES
+// =========================
 
 interface Zone {
   id: number;
@@ -33,10 +38,40 @@ interface Actuator {
   actuator: string;
   type: string;
   control_mode: string;
+  reported_control_mode?: string | null;
   desired_state: boolean;
   actual_state: boolean | null;
   state_updated_at: string | null;
 }
+
+interface ActuatorStateUpdate {
+  farmId?: number | string;
+  farm_id?: number | string;
+
+  esp32Id?: string;
+  esp32_id?: string;
+
+  actuator: string;
+
+  actualState?: boolean | null;
+  actual_state?: boolean | null;
+
+  desiredState?: boolean;
+  desired_state?: boolean;
+
+  value?: number | boolean;
+
+  controlMode?: string;
+  control_mode?: string;
+  reported_control_mode?: string | null;
+
+  timestamp?: string;
+  state_updated_at?: string;
+}
+
+// =========================
+// COMPONENT
+// =========================
 
 function ZonePage() {
   const { farmId } = useParams<{ farmId: string }>();
@@ -47,11 +82,15 @@ function ZonePage() {
 
   const [loading, setLoading] = useState(true);
   const [actuatorLoading, setActuatorLoading] = useState(false);
+
   const [error, setError] = useState('');
   const [actuatorError, setActuatorError] = useState('');
   const [commandMessage, setCommandMessage] = useState('');
 
+  // =========================
   // FETCH ZONES
+  // =========================
+
   useEffect(() => {
     const fetchZones = async () => {
       if (!farmId) {
@@ -62,6 +101,7 @@ function ZonePage() {
 
       try {
         const response = await api.get(`/farms/${farmId}/zones`);
+
         const result = response.data?.data ?? response.data;
 
         setZones(Array.isArray(result) ? result : []);
@@ -76,7 +116,7 @@ function ZonePage() {
 
         setError(
           err.response?.data?.message ||
-          'Không thể lấy danh sách Zone',
+            'Không thể lấy danh sách Zone',
         );
       } finally {
         setLoading(false);
@@ -86,20 +126,25 @@ function ZonePage() {
     fetchZones();
   }, [farmId, navigate]);
 
-  // FETCH FARM-LEVEL ACTUATORS
+  // =========================
+  // FETCH FARM ACTUATORS
+  // =========================
+
   useEffect(() => {
     let cancelled = false;
 
     const fetchActuators = async () => {
       try {
         const response = await api.get('/bbb/actuators/state');
+
         const result = response.data?.data ?? response.data;
 
         if (cancelled) return;
 
-        const allActuators: Actuator[] = Array.isArray(result?.actuators)
-          ? result.actuators
-          : [];
+        const allActuators: Actuator[] =
+          Array.isArray(result?.actuators)
+            ? result.actuators
+            : [];
 
         const farmActuators = allActuators.filter(
           (item) =>
@@ -109,8 +154,16 @@ function ZonePage() {
         );
 
         setActuators(farmActuators);
+
+        console.log(
+          '[FARM] Actuators loaded:',
+          farmActuators,
+        );
       } catch (err: any) {
-        console.error('Get farm actuator state error:', err);
+        console.error(
+          'Get farm actuator state error:',
+          err,
+        );
 
         if (err.response?.status === 401) {
           localStorage.removeItem('accessToken');
@@ -119,20 +172,195 @@ function ZonePage() {
         }
 
         if (!cancelled) {
-          setActuatorError('Unable to load farm device states.');
+          setActuatorError(
+            'Unable to load farm device states.',
+          );
         }
       }
     };
 
-    if (farmId) fetchActuators();
+    if (farmId) {
+      fetchActuators();
+    }
 
     return () => {
       cancelled = true;
     };
   }, [farmId, navigate]);
 
+  // =========================
+  // WEBSOCKET
+  // FARM ACTUATOR STATE
+  // =========================
+
+  useEffect(() => {
+    if (!farmId) return;
+
+    const socketUrl =
+      import.meta.env.VITE_WS_URL ||
+      'http://localhost:3001';
+
+    const socket = io(socketUrl, {
+      transports: ['websocket'],
+    });
+
+    socket.on('connect', () => {
+      console.log(
+        '[FARM WS] Connected:',
+        socket.id,
+      );
+    });
+
+    socket.on('connect_error', (err) => {
+      console.error(
+        '[FARM WS] Connection error:',
+        err.message,
+      );
+    });
+
+    socket.on(
+      'actuator:state',
+      (update: ActuatorStateUpdate) => {
+        console.log(
+          '[FARM WS] Actuator state received:',
+          update,
+        );
+
+        // Only handle FAN and LIGHT.
+        if (!['fan', 'light'].includes(update.actuator)) {
+          return;
+        }
+
+        const updatedFarmId =
+          update.farmId ?? update.farm_id;
+
+        const updatedEsp32Id =
+          update.esp32Id ?? update.esp32_id;
+
+        // Check farm identity when provided.
+        if (
+          updatedFarmId !== undefined &&
+          Number(updatedFarmId) !== Number(farmId)
+        ) {
+          return;
+        }
+
+        // Normalize actual state.
+        let actualState: boolean | null | undefined;
+
+        if (typeof update.actualState === 'boolean') {
+          actualState = update.actualState;
+        } else if (
+          typeof update.actual_state === 'boolean' ||
+          update.actual_state === null
+        ) {
+          actualState = update.actual_state;
+        } else if (
+          update.value === 0 ||
+          update.value === 1 ||
+          typeof update.value === 'boolean'
+        ) {
+          actualState = Boolean(update.value);
+        }
+
+        // Normalize desired state.
+        const desiredState =
+          typeof update.desiredState === 'boolean'
+            ? update.desiredState
+            : typeof update.desired_state === 'boolean'
+              ? update.desired_state
+              : undefined;
+
+        const reportedMode =
+          update.controlMode ??
+          update.control_mode ??
+          update.reported_control_mode;
+
+        // Do not update if no actual state is available.
+        if (actualState === undefined) {
+          console.warn(
+            '[FARM WS] No valid actual state:',
+            update,
+          );
+          return;
+        }
+
+        setActuators((previous) => {
+          const matched = previous.some(
+            (item) =>
+              item.actuator === update.actuator &&
+              (
+                !updatedEsp32Id ||
+                item.esp32_id === updatedEsp32Id
+              ),
+          );
+
+          if (!matched) {
+            console.warn(
+              '[FARM WS] No matching actuator:',
+              update,
+            );
+            return previous;
+          }
+
+          return previous.map((item) => {
+            const isTarget =
+              item.actuator === update.actuator &&
+              (
+                !updatedEsp32Id ||
+                item.esp32_id === updatedEsp32Id
+              );
+
+            if (!isTarget) return item;
+
+            return {
+              ...item,
+              actual_state: actualState,
+              desired_state:
+                desiredState ?? item.desired_state,
+              control_mode:
+                reportedMode ?? item.control_mode,
+              reported_control_mode:
+                reportedMode ?? item.reported_control_mode,
+              state_updated_at:
+                update.state_updated_at ??
+                update.timestamp ??
+                new Date().toISOString(),
+            };
+          });
+        });
+
+        setCommandMessage(
+          `${update.actuator === 'fan' ? 'Fan' : 'Light'} status updated from device.`,
+        );
+
+        setActuatorError('');
+
+        console.log(
+          '[FARM WS] Device state processed:',
+          update.actuator,
+          actualState,
+        );
+      },
+    );
+
+    return () => {
+      socket.off('connect');
+      socket.off('connect_error');
+      socket.off('actuator:state');
+      socket.disconnect();
+
+      console.log('[FARM WS] Disconnected');
+    };
+  }, [farmId]);
+
+  // =========================
   // CONTROL FARM ACTUATOR
-  const handleActuatorToggle = async (actuator: Actuator) => {
+  // =========================
+
+  const handleActuatorToggle = async (
+    actuator: Actuator,
+  ) => {
     if (actuatorLoading) return;
 
     const currentState =
@@ -141,7 +369,9 @@ function ZonePage() {
     const nextState = currentState ? 0 : 1;
 
     const confirmed = window.confirm(
-      `Do you want to turn ${actuator.actuator} ${nextState ? 'on' : 'off'}?`,
+      `Do you want to turn ${actuator.actuator} ${
+        nextState ? 'on' : 'off'
+      }?`,
     );
 
     if (!confirmed) return;
@@ -172,13 +402,19 @@ function ZonePage() {
         },
       );
 
-      console.log('Farm actuator command:', response.data);
+      console.log(
+        '[FARM] Actuator command accepted:',
+        response.data,
+      );
 
       setCommandMessage(
         `Command sent to ${actuator.actuator}. Waiting for device feedback.`,
       );
     } catch (err: any) {
-      console.error('Farm actuator control error:', err);
+      console.error(
+        'Farm actuator control error:',
+        err,
+      );
 
       if (err.response?.status === 401) {
         localStorage.removeItem('accessToken');
@@ -188,12 +424,16 @@ function ZonePage() {
 
       setActuatorError(
         err.response?.data?.message ||
-        'Failed to send actuator command.',
+          'Failed to send actuator command.',
       );
     } finally {
       setActuatorLoading(false);
     }
   };
+
+  // =========================
+  // NAVIGATION
+  // =========================
 
   const handleZoneClick = (zoneId: number) => {
     navigate(`/zones/${zoneId}`);
@@ -203,6 +443,10 @@ function ZonePage() {
     navigate('/farms');
   };
 
+  // =========================
+  // LOADING
+  // =========================
+
   if (loading) {
     return (
       <div className="page-loading">
@@ -211,6 +455,10 @@ function ZonePage() {
       </div>
     );
   }
+
+  // =========================
+  // PAGE
+  // =========================
 
   return (
     <div className="app-page">
@@ -242,7 +490,9 @@ function ZonePage() {
 
           <div className="page-count">
             <span>{zones.length}</span>
-            <small>{zones.length === 1 ? 'Zone' : 'Zones'}</small>
+            <small>
+              {zones.length === 1 ? 'Zone' : 'Zones'}
+            </small>
           </div>
         </div>
 
@@ -252,7 +502,8 @@ function ZonePage() {
           </div>
         )}
 
-        {/* FARM-LEVEL DEVICE CONTROL */}
+        {/* FARM DEVICE CONTROL */}
+
         <section className="actuator-section">
           <div className="section-heading">
             <div>
@@ -282,11 +533,23 @@ function ZonePage() {
               );
 
               const isOn = actuator?.actual_state;
-              const Icon = name === 'fan' ? Fan : Lightbulb;
-              const label = name === 'fan' ? 'Fan' : 'Light';
+
+              const Icon =
+                name === 'fan' ? Fan : Lightbulb;
+
+              const label =
+                name === 'fan' ? 'Fan' : 'Light';
+
+              const currentState =
+                actuator?.actual_state ??
+                actuator?.desired_state ??
+                false;
 
               return (
-                <article className="actuator-card" key={name}>
+                <article
+                  className="actuator-card"
+                  key={name}
+                >
                   <div className="actuator-card-top">
                     <div
                       className={`actuator-icon ${
@@ -306,6 +569,7 @@ function ZonePage() {
                       }`}
                     >
                       <span className="actuator-state-dot" />
+
                       {isOn === null || !actuator
                         ? 'UNKNOWN'
                         : isOn
@@ -316,22 +580,35 @@ function ZonePage() {
 
                   <div className="actuator-card-body">
                     <h3>{label}</h3>
+
                     <p>
                       {name === 'fan'
                         ? 'Farm ventilation'
                         : 'Farm supplementary lighting'}
                     </p>
+
+                    {actuator && (
+                      <p>
+                        <small>
+                          Device: {actuator.esp32_id}
+                        </small>
+                      </p>
+                    )}
                   </div>
 
                   <div className="actuator-card-footer">
                     <span className="actuator-mode auto">
-                      {actuator?.control_mode?.toUpperCase() ?? '--'}
+                      {actuator?.reported_control_mode?.toUpperCase() ??
+                        actuator?.control_mode?.toUpperCase() ??
+                        '--'}
                     </span>
 
                     <button
                       type="button"
                       className="actuator-toggle-button"
-                      disabled={!actuator || actuatorLoading}
+                      disabled={
+                        !actuator || actuatorLoading
+                      }
                       onClick={() => {
                         if (actuator) {
                           handleActuatorToggle(actuator);
@@ -339,7 +616,8 @@ function ZonePage() {
                       }}
                     >
                       <Power size={16} />
-                      Turn {actuator?.desired_state ? 'off' : 'on'}
+
+                      Turn {currentState ? 'off' : 'on'}
                     </button>
                   </div>
                 </article>
@@ -353,10 +631,12 @@ function ZonePage() {
         <ActuatorHistory farmId={farmId} />
 
         {/* ZONE LIST */}
+
         <section className="zone-list-section">
           <div className="section-heading">
             <div>
               <h2>Farm Zones</h2>
+
               <p>
                 Select a zone to open its monitoring dashboard.
               </p>
@@ -381,7 +661,9 @@ function ZonePage() {
                 <div
                   key={zone.id}
                   className="zone-card"
-                  onClick={() => handleZoneClick(zone.id)}
+                  onClick={() =>
+                    handleZoneClick(zone.id)
+                  }
                 >
                   <div className="zone-card-top">
                     <div className="zone-icon">

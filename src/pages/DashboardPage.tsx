@@ -44,7 +44,7 @@ interface TelemetryItem {
 
 interface TelemetryUpdate {
   bbbId: string;
-  zoneId: string | number;
+  zoneId: string | number | null;
   esp32Id: string;
   timestamp: string;
   sensors: Record<string, number>;
@@ -71,6 +71,23 @@ interface ActuatorStateUpdate {
   reported_control_mode?: string | null;
 
   timestamp?: string;
+}
+
+interface TankStatusUpdate {
+  bbbId: string;
+  farmId: number;
+  esp32Id: string;
+  tank_status: number;
+  status: 'AVAILABLE' | 'EMPTY';
+  timestamp: string;
+}
+
+interface TankStatusResponse {
+  farm_id: number;
+  zone_id: number;
+  tank_status: number | null;
+  tank_status_updated_at: string | null;
+  status: 'AVAILABLE' | 'EMPTY' | 'UNKNOWN';
 }
 
 interface ApiActuator {
@@ -101,6 +118,8 @@ type SensorType =
 type Period = 1 | 7 | 30;
 
 type ActuatorMode = 'AUTO' | 'MANUAL';
+
+type TankStatus = 'AVAILABLE' | 'EMPTY' | 'UNKNOWN';
 
 interface Actuator {
   actuatorId: number;
@@ -162,6 +181,31 @@ const sensorConfig: Record<SensorType, SensorConfig> = {
 };
 
 // =========================
+// TANK STATUS HELPERS
+// =========================
+
+const getTankStatusFromValue = (
+  value: number | null | undefined,
+): TankStatus => {
+  if (value === 0) return 'AVAILABLE';
+  if (value === 1) return 'EMPTY';
+  return 'UNKNOWN';
+};
+
+const getTankStatusLabel = (status: TankStatus): string => {
+  switch (status) {
+    case 'AVAILABLE':
+      return 'Available';
+
+    case 'EMPTY':
+      return 'Empty';
+
+    default:
+      return 'Unknown';
+  }
+};
+
+// =========================
 // COMPONENT
 // =========================
 
@@ -205,6 +249,20 @@ function DashboardPage() {
     useState(false);
 
   // =========================
+  // TANK STATUS STATE
+  // =========================
+
+  const [tankStatus, setTankStatus] =
+    useState<TankStatus>('UNKNOWN');
+
+  const [tankStatusUpdatedAt, setTankStatusUpdatedAt] =
+    useState<string | null>(null);
+
+  // Store farm ID so the WebSocket only handles
+  // tank status events belonging to this zone's farm.
+  const tankFarmIdRef = useRef<number | null>(null);
+
+  // =========================
   // AUTO SCROLL TO HISTORY
   // =========================
 
@@ -222,6 +280,83 @@ function DashboardPage() {
       window.cancelAnimationFrame(animationFrameId);
     };
   }, [selectedSensor]);
+
+  // =========================
+  // FETCH TANK STATUS
+  // =========================
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const fetchTankStatus = async () => {
+      if (!zoneId) return;
+
+      try {
+        const token = localStorage.getItem('accessToken');
+
+        if (!token) {
+          navigate('/login');
+          return;
+        }
+
+        const response = await api.get(
+          `/zones/${zoneId}/tank-status`,
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          },
+        );
+
+        const result: TankStatusResponse =
+          response.data?.data ?? response.data;
+
+        if (cancelled) return;
+
+        // Save farm ID for WebSocket filtering.
+        tankFarmIdRef.current =
+          result?.farm_id != null
+            ? Number(result.farm_id)
+            : null;
+
+        // Always use the numeric tank_status convention:
+        // 0 = AVAILABLE
+        // 1 = EMPTY
+        // null = UNKNOWN
+        setTankStatus(
+          getTankStatusFromValue(result?.tank_status),
+        );
+
+        setTankStatusUpdatedAt(
+          result?.tank_status_updated_at ?? null,
+        );
+
+        console.log('[TANK] Initial status loaded:', result);
+      } catch (err: any) {
+        console.error(
+          '[TANK] Failed to fetch tank status:',
+          err,
+        );
+
+        if (err?.response?.status === 401) {
+          localStorage.removeItem('accessToken');
+          navigate('/login');
+          return;
+        }
+
+        if (!cancelled) {
+          setTankStatus('UNKNOWN');
+          setTankStatusUpdatedAt(null);
+        }
+      }
+    };
+
+    fetchTankStatus();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [zoneId, navigate]);
 
   // =========================
   // FETCH ACTUATOR STATE
@@ -298,10 +433,7 @@ function DashboardPage() {
 
         setActuatorStateReceived(true);
 
-        console.log(
-          'Pump state loaded:',
-          pump,
-        );
+        console.log('Pump state loaded:', pump);
       } catch (err: any) {
         console.error(
           'Failed to fetch pump state:',
@@ -397,7 +529,7 @@ function DashboardPage() {
 
   // =========================
   // WEBSOCKET
-  // TELEMETRY + ACTUATOR STATE
+  // TELEMETRY + ACTUATOR + TANK
   // =========================
 
   useEffect(() => {
@@ -437,6 +569,7 @@ function DashboardPage() {
       'telemetry:update',
       (update: TelemetryUpdate) => {
         if (
+          update.zoneId == null ||
           Number(update.zoneId) !== Number(zoneId)
         ) {
           return;
@@ -470,6 +603,58 @@ function DashboardPage() {
 
           return [...previous, ...uniqueItems];
         });
+      },
+    );
+
+    // -------------------------
+    // TANK STATUS UPDATE
+    // -------------------------
+
+    socket.on(
+      'tank:status',
+      (update: TankStatusUpdate) => {
+        console.log(
+          '[WEBSOCKET] Tank status received:',
+          update,
+        );
+
+        // Only accept Node3 tank status.
+        if (update.esp32Id !== 'ESP32_NODE3') {
+          return;
+        }
+
+        // Validate status value.
+        if (
+          update.tank_status !== 0 &&
+          update.tank_status !== 1
+        ) {
+          return;
+        }
+
+        // Do not accept another farm's tank status.
+        const currentFarmId = tankFarmIdRef.current;
+
+        if (
+          currentFarmId === null ||
+          Number(update.farmId) !== currentFarmId
+        ) {
+          return;
+        }
+
+        setTankStatus(
+          getTankStatusFromValue(update.tank_status),
+        );
+
+        setTankStatusUpdatedAt(
+          update.timestamp ?? null,
+        );
+
+        console.log(
+          '[WEBSOCKET] Tank UI updated:',
+          update.tank_status === 0
+            ? 'AVAILABLE'
+            : 'EMPTY',
+        );
       },
     );
 
@@ -583,6 +768,7 @@ function DashboardPage() {
       socket.off('connect');
       socket.off('connect_error');
       socket.off('telemetry:update');
+      socket.off('tank:status');
       socket.off('actuator:state');
       socket.disconnect();
     };
@@ -611,8 +797,6 @@ function DashboardPage() {
   const latestSoilMoisture = getLatestValue('soil_moisture');
 
   const latestLight = getLatestValue('light');
-
-  const latestTankStatus = getLatestValue('tank_status');
 
   const latestWaterFlow = getLatestValue('water_flow');
 
@@ -763,17 +947,6 @@ function DashboardPage() {
   const handleBack = () => {
     navigate(-1);
   };
-
-  // =========================
-  // TANK STATUS
-  // =========================
-
-  const tankStatus =
-    latestTankStatus?.value === 1
-      ? 'Available'
-      : latestTankStatus?.value === 0
-        ? 'Empty'
-        : '--';
 
   // =========================
   // LOADING
@@ -1006,11 +1179,17 @@ function DashboardPage() {
               </div>
 
               <h2 className="tank-value">
-                {tankStatus}
+                {getTankStatusLabel(tankStatus)}
               </h2>
 
               <span className="sensor-hint">
-                Current tank status
+                {tankStatusUpdatedAt
+                  ? `Updated: ${new Date(
+                      tankStatusUpdatedAt,
+                    ).toLocaleString('vi-VN', {
+                      timeZone: 'Asia/Ho_Chi_Minh',
+                    })}`
+                  : 'Waiting for tank status'}
               </span>
             </div>
 
