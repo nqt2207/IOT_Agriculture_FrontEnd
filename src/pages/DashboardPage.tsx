@@ -50,6 +50,29 @@ interface TelemetryUpdate {
   sensors: Record<string, number>;
 }
 
+interface ActuatorStateUpdate {
+  zoneId?: number | string;
+  zone_id?: number | string;
+
+  esp32Id?: string;
+  esp32_id?: string;
+
+  actuator: string;
+
+  actualState?: boolean | null;
+  actual_state?: boolean | null;
+  value?: number;
+
+  desiredState?: boolean;
+  desired_state?: boolean;
+
+  controlMode?: string;
+  control_mode?: string;
+  reported_control_mode?: string | null;
+
+  timestamp?: string;
+}
+
 interface ApiActuator {
   actuator_id: number;
   farm_id: number;
@@ -373,7 +396,8 @@ function DashboardPage() {
   }, [zoneId, navigate]);
 
   // =========================
-  // WEBSOCKET TELEMETRY
+  // WEBSOCKET
+  // TELEMETRY + ACTUATOR STATE
   // =========================
 
   useEffect(() => {
@@ -386,6 +410,10 @@ function DashboardPage() {
     const socket = io(socketUrl, {
       transports: ['websocket'],
     });
+
+    // -------------------------
+    // SOCKET CONNECT
+    // -------------------------
 
     socket.on('connect', () => {
       console.log(
@@ -400,6 +428,10 @@ function DashboardPage() {
         socketError.message,
       );
     });
+
+    // -------------------------
+    // TELEMETRY UPDATE
+    // -------------------------
 
     socket.on(
       'telemetry:update',
@@ -441,7 +473,117 @@ function DashboardPage() {
       },
     );
 
+    // -------------------------
+    // ACTUATOR STATE UPDATE
+    // -------------------------
+
+    socket.on(
+      'actuator:state',
+      (update: ActuatorStateUpdate) => {
+        console.log(
+          '[WEBSOCKET] Actuator state received:',
+          update,
+        );
+
+        const updatedZoneId =
+          update.zoneId ?? update.zone_id;
+
+        const updatedEsp32Id =
+          update.esp32Id ?? update.esp32_id;
+
+        // Only handle the current zone.
+        if (
+          updatedZoneId !== undefined &&
+          Number(updatedZoneId) !== Number(zoneId)
+        ) {
+          return;
+        }
+
+        // This page only controls pump1.
+        if (update.actuator !== 'pump1') {
+          return;
+        }
+
+        setActuator((previous) => {
+          if (!previous) return previous;
+
+          // Verify ESP32 identity.
+          if (
+            updatedEsp32Id &&
+            previous.esp32Id !== updatedEsp32Id
+          ) {
+            return previous;
+          }
+
+          // Read actual state from Backend payload.
+          let actualState: boolean | null | undefined;
+
+          if (typeof update.actualState === 'boolean') {
+            actualState = update.actualState;
+          } else if (
+            typeof update.actual_state === 'boolean' ||
+            update.actual_state === null
+          ) {
+            actualState = update.actual_state;
+          } else if (
+            update.value === 0 ||
+            update.value === 1
+          ) {
+            actualState = update.value === 1;
+          }
+
+          // Read desired state if Backend provides it.
+          const desiredState =
+            typeof update.desiredState === 'boolean'
+              ? update.desiredState
+              : typeof update.desired_state === 'boolean'
+                ? update.desired_state
+                : previous.desiredState;
+
+          // Read reported control mode if available.
+          const reportedMode =
+            update.controlMode ??
+            update.control_mode ??
+            update.reported_control_mode;
+
+          // No valid actual state: do not change the UI.
+          if (actualState === undefined) {
+            return previous;
+          }
+
+          const nextActuator: Actuator = {
+            ...previous,
+            state: actualState,
+            desiredState,
+            mode: reportedMode
+              ? reportedMode.toLowerCase() === 'manual'
+                ? 'MANUAL'
+                : 'AUTO'
+              : previous.mode,
+          };
+
+          console.log(
+            '[WEBSOCKET] Pump UI updated:',
+            nextActuator,
+          );
+
+          return nextActuator;
+        });
+
+        setActuatorStateReceived(true);
+        setActuatorMessage('');
+      },
+    );
+
+    // -------------------------
+    // CLEANUP
+    // -------------------------
+
     return () => {
+      socket.off('connect');
+      socket.off('connect_error');
+      socket.off('telemetry:update');
+      socket.off('actuator:state');
       socket.disconnect();
     };
   }, [zoneId]);
