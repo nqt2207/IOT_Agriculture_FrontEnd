@@ -51,8 +51,8 @@ interface TelemetryUpdate {
 }
 
 interface ActuatorStateUpdate {
-  zoneId?: number | string;
-  zone_id?: number | string;
+  zoneId?: number | string | null;
+  zone_id?: number | string | null;
 
   esp32Id?: string;
   esp32_id?: string;
@@ -184,11 +184,16 @@ const sensorConfig: Record<SensorType, SensorConfig> = {
 // TANK STATUS HELPERS
 // =========================
 
+// 0 = EMPTY
+// 1 = AVAILABLE
+// null / invalid = UNKNOWN
+
 const getTankStatusFromValue = (
   value: number | null | undefined,
 ): TankStatus => {
-  if (value === 0) return 'AVAILABLE';
-  if (value === 1) return 'EMPTY';
+  if (value === 0) return 'EMPTY';
+  if (value === 1) return 'AVAILABLE';
+
   return 'UNKNOWN';
 };
 
@@ -203,6 +208,36 @@ const getTankStatusLabel = (status: TankStatus): string => {
     default:
       return 'Unknown';
   }
+};
+
+// =========================
+// ACTUATOR HELPERS
+// =========================
+
+const normalizeActuatorMode = (
+  mode?: string | null,
+): ActuatorMode => {
+  return mode?.toLowerCase() === 'manual'
+    ? 'MANUAL'
+    : 'AUTO';
+};
+
+const mapApiActuator = (
+  pump: ApiActuator,
+): Actuator => {
+  const reportedMode =
+    pump.reported_control_mode ?? pump.control_mode;
+
+  return {
+    actuatorId: pump.actuator_id,
+    esp32Id: pump.esp32_id,
+    id: 'pump1',
+    label: 'Pump',
+    description: 'Irrigation water supply',
+    state: pump.actual_state,
+    desiredState: pump.desired_state,
+    mode: normalizeActuatorMode(reportedMode),
+  };
 };
 
 // =========================
@@ -258,8 +293,6 @@ function DashboardPage() {
   const [tankStatusUpdatedAt, setTankStatusUpdatedAt] =
     useState<string | null>(null);
 
-  // Store farm ID so the WebSocket only handles
-  // tank status events belonging to this zone's farm.
   const tankFarmIdRef = useRef<number | null>(null);
 
   // =========================
@@ -313,16 +346,11 @@ function DashboardPage() {
 
         if (cancelled) return;
 
-        // Save farm ID for WebSocket filtering.
         tankFarmIdRef.current =
           result?.farm_id != null
             ? Number(result.farm_id)
             : null;
 
-        // Always use the numeric tank_status convention:
-        // 0 = AVAILABLE
-        // 1 = EMPTY
-        // null = UNKNOWN
         setTankStatus(
           getTankStatusFromValue(result?.tank_status),
         );
@@ -331,7 +359,12 @@ function DashboardPage() {
           result?.tank_status_updated_at ?? null,
         );
 
-        console.log('[TANK] Initial status loaded:', result);
+        console.log('[TANK] Initial status loaded:', {
+          ...result,
+          interpreted_status: getTankStatusFromValue(
+            result?.tank_status,
+          ),
+        });
       } catch (err: any) {
         console.error(
           '[TANK] Failed to fetch tank status:',
@@ -359,17 +392,20 @@ function DashboardPage() {
   }, [zoneId, navigate]);
 
   // =========================
-  // FETCH ACTUATOR STATE
+  // FETCH + POLL ACTUATOR STATE
   // =========================
 
   useEffect(() => {
+    if (!zoneId) return;
+
     let cancelled = false;
+    let isFetching = false;
 
     const fetchActuatorState = async () => {
-      if (!zoneId) return;
+      if (isFetching || cancelled) return;
 
       try {
-        setActuatorError('');
+        isFetching = true;
 
         const token = localStorage.getItem('accessToken');
 
@@ -384,6 +420,8 @@ function DashboardPage() {
           },
         });
 
+        if (cancelled) return;
+
         const result = response.data?.data ?? response.data;
 
         const allActuators: ApiActuator[] =
@@ -391,74 +429,75 @@ function DashboardPage() {
             ? result.actuators
             : [];
 
-        // Find pump assigned to the current zone.
         const pump = allActuators.find(
           (item) =>
             Number(item.zone_id) === Number(zoneId) &&
-            item.scope === 'zone' &&
+            item.scope?.toLowerCase() === 'zone' &&
             item.actuator === 'pump1',
         );
-
-        if (cancelled) return;
 
         if (!pump) {
           setActuator(null);
           setActuatorStateReceived(false);
 
-          console.warn(
-            'No pump found for zone:',
+          console.warn('[PUMP POLLING] No pump found:', {
             zoneId,
-            allActuators,
-          );
+            actuators: allActuators,
+          });
 
           return;
         }
 
-        const reportedMode =
-          pump.reported_control_mode ?? pump.control_mode;
+        const nextActuator = mapApiActuator(pump);
 
-        setActuator({
-          actuatorId: pump.actuator_id,
-          esp32Id: pump.esp32_id,
-          id: 'pump1',
-          label: 'Pump',
-          description: 'Irrigation water supply',
-          state: pump.actual_state,
-          desiredState: pump.desired_state,
-          mode:
-            reportedMode?.toLowerCase() === 'manual'
-              ? 'MANUAL'
-              : 'AUTO',
+        setActuator((previous) => {
+          if (
+            previous &&
+            previous.esp32Id !== nextActuator.esp32Id
+          ) {
+            return previous;
+          }
+
+          return nextActuator;
         });
 
         setActuatorStateReceived(true);
 
-        console.log('Pump state loaded:', pump);
+        console.log('[PUMP POLLING] State synchronized:', {
+          esp32_id: pump.esp32_id,
+          actual_state: pump.actual_state,
+          desired_state: pump.desired_state,
+          control_mode:
+            pump.reported_control_mode ?? pump.control_mode,
+        });
       } catch (err: any) {
-        console.error(
-          'Failed to fetch pump state:',
-          err,
-        );
+        console.error('[PUMP POLLING] Failed:', err);
 
         if (err?.response?.status === 401) {
           localStorage.removeItem('accessToken');
           navigate('/login');
-          return;
-        }
-
-        if (!cancelled) {
+        } else if (!cancelled) {
           setActuatorError(
             err?.response?.data?.message ||
-              'Unable to load pump state.',
+              'Unable to synchronize pump state.',
           );
         }
+      } finally {
+        isFetching = false;
       }
     };
 
+    // Fetch ngay khi mở trang.
     fetchActuatorState();
+
+    // Đồng bộ trạng thái mỗi 3 giây.
+    const pollingInterval = window.setInterval(() => {
+      fetchActuatorState();
+    }, 3000);
 
     return () => {
       cancelled = true;
+      window.clearInterval(pollingInterval);
     };
   }, [zoneId, navigate]);
 
@@ -495,6 +534,11 @@ function DashboardPage() {
 
         if (!cancelled) {
           setTelemetry(Array.isArray(result) ? result : []);
+
+          console.log(
+            '[TELEMETRY] Initial data loaded:',
+            result,
+          );
         }
       } catch (err: any) {
         console.error(
@@ -540,7 +584,11 @@ function DashboardPage() {
       'http://localhost:3001';
 
     const socket = io(socketUrl, {
-      transports: ['websocket'],
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      timeout: 20000,
     });
 
     // -------------------------
@@ -548,17 +596,23 @@ function DashboardPage() {
     // -------------------------
 
     socket.on('connect', () => {
-      console.log(
-        'WebSocket connected:',
-        socket.id,
-      );
+      console.log('[WS] Connected:', socket.id);
+      console.log('[WS] Server:', socketUrl);
+    });
+
+    socket.on('disconnect', (reason) => {
+      console.warn('[WS] Disconnected:', reason);
     });
 
     socket.on('connect_error', (socketError) => {
       console.error(
-        'WebSocket connection error:',
+        '[WS] Connection error:',
         socketError.message,
       );
+    });
+
+    socket.io.on('reconnect_attempt', (attempt) => {
+      console.warn('[WS] Reconnect attempt:', attempt);
     });
 
     // -------------------------
@@ -568,6 +622,11 @@ function DashboardPage() {
     socket.on(
       'telemetry:update',
       (update: TelemetryUpdate) => {
+        console.log(
+          '[WEBSOCKET] Telemetry received:',
+          update,
+        );
+
         if (
           update.zoneId == null ||
           Number(update.zoneId) !== Number(zoneId)
@@ -575,16 +634,35 @@ function DashboardPage() {
           return;
         }
 
+        if (
+          !update.sensors ||
+          typeof update.sensors !== 'object'
+        ) {
+          console.warn(
+            '[WEBSOCKET] Invalid telemetry sensors:',
+            update,
+          );
+          return;
+        }
+
         const newItems: TelemetryItem[] = Object.entries(
           update.sensors,
-        ).map(([sensor, value]) => ({
-          sensor,
-          value,
-          timestamp: update.timestamp,
-          zoneId: Number(update.zoneId),
-          bbbId: update.bbbId,
-          esp32Id: update.esp32Id,
-        }));
+        )
+          .filter(
+            ([, value]) =>
+              typeof value === 'number' &&
+              Number.isFinite(value),
+          )
+          .map(([sensor, value]) => ({
+            sensor,
+            value,
+            timestamp: update.timestamp,
+            zoneId: Number(update.zoneId),
+            bbbId: update.bbbId,
+            esp32Id: update.esp32Id,
+          }));
+
+        if (newItems.length === 0) return;
 
         setTelemetry((previous) => {
           const existingKeys = new Set(
@@ -618,12 +696,10 @@ function DashboardPage() {
           update,
         );
 
-        // Only accept Node3 tank status.
         if (update.esp32Id !== 'ESP32_NODE3') {
           return;
         }
 
-        // Validate status value.
         if (
           update.tank_status !== 0 &&
           update.tank_status !== 1
@@ -631,13 +707,20 @@ function DashboardPage() {
           return;
         }
 
-        // Do not accept another farm's tank status.
         const currentFarmId = tankFarmIdRef.current;
 
         if (
           currentFarmId === null ||
           Number(update.farmId) !== currentFarmId
         ) {
+          console.warn(
+            '[WEBSOCKET] Ignored tank status: farm mismatch',
+            {
+              currentFarmId,
+              updatedFarmId: update.farmId,
+            },
+          );
+
           return;
         }
 
@@ -652,8 +735,8 @@ function DashboardPage() {
         console.log(
           '[WEBSOCKET] Tank UI updated:',
           update.tank_status === 0
-            ? 'AVAILABLE'
-            : 'EMPTY',
+            ? 'EMPTY'
+            : 'AVAILABLE',
         );
       },
     );
@@ -676,74 +759,94 @@ function DashboardPage() {
         const updatedEsp32Id =
           update.esp32Id ?? update.esp32_id;
 
-        // Only handle the current zone.
-        if (
-          updatedZoneId !== undefined &&
-          Number(updatedZoneId) !== Number(zoneId)
-        ) {
-          return;
-        }
-
-        // This page only controls pump1.
+        // Chỉ nhận trạng thái pump1.
         if (update.actuator !== 'pump1') {
           return;
         }
 
-        setActuator((previous) => {
-          if (!previous) return previous;
+        // Nếu payload có zoneId thì kiểm tra zone.
+        if (
+          updatedZoneId != null &&
+          Number(updatedZoneId) !== Number(zoneId)
+        ) {
+          console.warn(
+            '[WEBSOCKET] Ignored: zone mismatch',
+            {
+              currentZoneId: zoneId,
+              updatedZoneId,
+            },
+          );
 
-          // Verify ESP32 identity.
+          return;
+        }
+
+        // Đọc actual state.
+        let actualState: boolean | null | undefined;
+
+        if (typeof update.actualState === 'boolean') {
+          actualState = update.actualState;
+        } else if (
+          typeof update.actual_state === 'boolean' ||
+          update.actual_state === null
+        ) {
+          actualState = update.actual_state;
+        } else if (
+          update.value === 0 ||
+          update.value === 1
+        ) {
+          actualState = update.value === 1;
+        }
+
+        if (actualState === undefined) {
+          console.warn(
+            '[WEBSOCKET] Invalid actuator state payload:',
+            update,
+          );
+          return;
+        }
+
+        const reportedMode =
+          update.controlMode ??
+          update.control_mode ??
+          update.reported_control_mode;
+
+        const desiredState =
+          typeof update.desiredState === 'boolean'
+            ? update.desiredState
+            : typeof update.desired_state === 'boolean'
+              ? update.desired_state
+              : undefined;
+
+        setActuator((previous) => {
+          if (!previous) {
+            console.warn(
+              '[WEBSOCKET] Pump not loaded yet. Waiting for polling.',
+            );
+            return previous;
+          }
+
           if (
             updatedEsp32Id &&
             previous.esp32Id !== updatedEsp32Id
           ) {
-            return previous;
-          }
+            console.warn(
+              '[WEBSOCKET] Ignored: ESP32 mismatch',
+              {
+                currentEsp32Id: previous.esp32Id,
+                updatedEsp32Id,
+              },
+            );
 
-          // Read actual state from Backend payload.
-          let actualState: boolean | null | undefined;
-
-          if (typeof update.actualState === 'boolean') {
-            actualState = update.actualState;
-          } else if (
-            typeof update.actual_state === 'boolean' ||
-            update.actual_state === null
-          ) {
-            actualState = update.actual_state;
-          } else if (
-            update.value === 0 ||
-            update.value === 1
-          ) {
-            actualState = update.value === 1;
-          }
-
-          // Read desired state if Backend provides it.
-          const desiredState =
-            typeof update.desiredState === 'boolean'
-              ? update.desiredState
-              : typeof update.desired_state === 'boolean'
-                ? update.desired_state
-                : previous.desiredState;
-
-          // Read reported control mode if available.
-          const reportedMode =
-            update.controlMode ??
-            update.control_mode ??
-            update.reported_control_mode;
-
-          // No valid actual state: do not change the UI.
-          if (actualState === undefined) {
             return previous;
           }
 
           const nextActuator: Actuator = {
             ...previous,
             state: actualState,
-            desiredState,
+            desiredState:
+              desiredState ?? previous.desiredState,
             mode: reportedMode
-              ? reportedMode.toLowerCase() === 'manual'
-                ? 'MANUAL'
-                : 'AUTO'
+              ? normalizeActuatorMode(reportedMode)
               : previous.mode,
           };
 
@@ -757,6 +860,7 @@ function DashboardPage() {
 
         setActuatorStateReceived(true);
         setActuatorMessage('');
+        setActuatorError('');
       },
     );
 
@@ -766,10 +870,12 @@ function DashboardPage() {
 
     return () => {
       socket.off('connect');
+      socket.off('disconnect');
       socket.off('connect_error');
       socket.off('telemetry:update');
       socket.off('tank:status');
       socket.off('actuator:state');
+      socket.io.off('reconnect_attempt');
       socket.disconnect();
     };
   }, [zoneId]);
@@ -883,6 +989,44 @@ function DashboardPage() {
 
     const nextValue = currentState ? 0 : 1;
 
+    console.log('[PUMP CONTROL] Preparing command:', {
+      zoneId,
+      esp32Id: actuator.esp32Id,
+      actuator: 'pump1',
+      actualState: actuator.state,
+      desiredState: actuator.desiredState,
+      currentState,
+      nextValue,
+      tankStatus,
+      tankStatusUpdatedAt,
+    });
+
+    // Chỉ cho phép bật bơm khi bể có nước.
+    // Tắt bơm luôn được phép.
+    if (nextValue === 1 && tankStatus !== 'AVAILABLE') {
+      console.error(
+        '[PUMP CONTROL] BLOCKED BY FRONTEND:',
+        {
+          tankStatus,
+          tankStatusUpdatedAt,
+          nextValue,
+        },
+      );
+
+      setActuatorError(
+        tankStatus === 'EMPTY'
+          ? 'Cannot turn on the pump: the water tank is empty.'
+          : 'Cannot turn on the pump: tank status is unknown.',
+      );
+
+      setPendingActuator(null);
+      return;
+    }
+
+    console.log(
+      '[PUMP CONTROL] Tank check PASSED. Sending API request...',
+    );
+
     try {
       setActuatorLoading(true);
       setActuatorError('');
@@ -919,6 +1063,9 @@ function DashboardPage() {
       );
 
       setPendingActuator(null);
+
+      // Đồng bộ lại API sau khi gửi lệnh.
+      // Polling 3 giây vẫn tiếp tục chạy độc lập.
     } catch (err: any) {
       console.error(
         'Failed to control pump:',
