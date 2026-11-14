@@ -61,7 +61,7 @@ interface ActuatorStateUpdate {
 
   actualState?: boolean | null;
   actual_state?: boolean | null;
-  value?: number;
+  value?: number | null;
 
   desiredState?: boolean;
   desired_state?: boolean;
@@ -487,10 +487,8 @@ function DashboardPage() {
       }
     };
 
-    // Fetch ngay khi mở trang.
     fetchActuatorState();
 
-    // Đồng bộ trạng thái mỗi 3 giây.
     const pollingInterval = window.setInterval(() => {
       fetchActuatorState();
     }, 3000);
@@ -590,10 +588,6 @@ function DashboardPage() {
       reconnectionDelayMax: 5000,
       timeout: 20000,
     });
-
-    // -------------------------
-    // SOCKET CONNECT
-    // -------------------------
 
     socket.on('connect', () => {
       console.log('[WS] Connected:', socket.id);
@@ -759,12 +753,10 @@ function DashboardPage() {
         const updatedEsp32Id =
           update.esp32Id ?? update.esp32_id;
 
-        // Chỉ nhận trạng thái pump1.
         if (update.actuator !== 'pump1') {
           return;
         }
 
-        // Nếu payload có zoneId thì kiểm tra zone.
         if (
           updatedZoneId != null &&
           Number(updatedZoneId) !== Number(zoneId)
@@ -780,7 +772,6 @@ function DashboardPage() {
           return;
         }
 
-        // Đọc actual state.
         let actualState: boolean | null | undefined;
 
         if (typeof update.actualState === 'boolean') {
@@ -806,9 +797,9 @@ function DashboardPage() {
         }
 
         const reportedMode =
+          update.reported_control_mode ??
           update.controlMode ??
-          update.control_mode ??
-          update.reported_control_mode;
+          update.control_mode;
 
         const desiredState =
           typeof update.desiredState === 'boolean'
@@ -864,10 +855,6 @@ function DashboardPage() {
       },
     );
 
-    // -------------------------
-    // CLEANUP
-    // -------------------------
-
     return () => {
       socket.off('connect');
       socket.off('disconnect');
@@ -897,15 +884,10 @@ function DashboardPage() {
   };
 
   const latestTemperature = getLatestValue('temperature');
-
   const latestHumidity = getLatestValue('humidity');
-
   const latestSoilMoisture = getLatestValue('soil_moisture');
-
   const latestLight = getLatestValue('light');
-
   const latestWaterFlow = getLatestValue('water_flow');
-
   const latestWaterVolume = getLatestValue('water_volume');
 
   // =========================
@@ -975,6 +957,10 @@ function DashboardPage() {
     setPendingActuator('pump1');
   };
 
+  // -------------------------
+  // MANUAL ON / OFF
+  // -------------------------
+
   const confirmActuatorToggle = async () => {
     if (
       !pendingActuator ||
@@ -1001,7 +987,7 @@ function DashboardPage() {
       tankStatusUpdatedAt,
     });
 
-    // Chỉ cho phép bật bơm khi bể có nước.
+    // Không cho phép bật bơm khi bể EMPTY hoặc UNKNOWN.
     // Tắt bơm luôn được phép.
     if (nextValue === 1 && tankStatus !== 'AVAILABLE') {
       console.error(
@@ -1023,9 +1009,73 @@ function DashboardPage() {
       return;
     }
 
-    console.log(
-      '[PUMP CONTROL] Tank check PASSED. Sending API request...',
-    );
+    try {
+      setActuatorLoading(true);
+      setActuatorError('');
+      setActuatorMessage('');
+
+      const token = localStorage.getItem('accessToken');
+
+      if (!token) {
+        navigate('/login');
+        return;
+      }
+
+      const response = await api.post(
+        '/bbb/actuators/control',
+        {
+          esp32_id: actuator.esp32Id,
+          actuator: 'pump1',
+          action: 'SET_STATE',
+          mode: 'MANUAL',
+          state: nextValue,
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        },
+      );
+
+      console.log(
+        '[PUMP CONTROL] Manual command accepted:',
+        response.data,
+      );
+
+      setActuatorMessage(
+        'Manual command sent successfully. Waiting for device feedback.',
+      );
+
+      setPendingActuator(null);
+    } catch (err: any) {
+      console.error(
+        '[PUMP CONTROL] Failed:',
+        err,
+      );
+
+      if (err?.response?.status === 401) {
+        localStorage.removeItem('accessToken');
+        navigate('/login');
+        return;
+      }
+
+      setActuatorError(
+        err?.response?.data?.message ||
+          'Failed to send pump command. Please try again.',
+      );
+    } finally {
+      setActuatorLoading(false);
+    }
+  };
+
+  // -------------------------
+  // RETURN TO AUTO
+  // -------------------------
+
+  const handlePumpReturnToAuto = async () => {
+    if (!actuator || actuatorLoading) return;
+
+    if (actuator.mode !== 'MANUAL') return;
 
     try {
       setActuatorLoading(true);
@@ -1044,7 +1094,8 @@ function DashboardPage() {
         {
           esp32_id: actuator.esp32Id,
           actuator: 'pump1',
-          state: nextValue,
+          action: 'RETURN_TO_AUTO',
+          mode: 'AUTO',
         },
         {
           headers: {
@@ -1054,21 +1105,16 @@ function DashboardPage() {
       );
 
       console.log(
-        'Pump command accepted by backend:',
+        '[PUMP] Return to AUTO accepted:',
         response.data,
       );
 
       setActuatorMessage(
-        'Command sent successfully. Waiting for device feedback.',
+        'Return to AUTO request sent. Waiting for BBB confirmation.',
       );
-
-      setPendingActuator(null);
-
-      // Đồng bộ lại API sau khi gửi lệnh.
-      // Polling 3 giây vẫn tiếp tục chạy độc lập.
     } catch (err: any) {
       console.error(
-        'Failed to control pump:',
+        '[PUMP] Return to AUTO failed:',
         err,
       );
 
@@ -1080,7 +1126,7 @@ function DashboardPage() {
 
       setActuatorError(
         err?.response?.data?.message ||
-          'Failed to send pump command. Please try again.',
+          'Failed to return pump to AUTO mode.',
       );
     } finally {
       setActuatorLoading(false);
@@ -1516,6 +1562,18 @@ function DashboardPage() {
                         actuator.desiredState)
                         ? 'off'
                         : 'on'}
+                    </button>
+
+                    <button
+                      type="button"
+                      className="actuator-auto-button"
+                      onClick={handlePumpReturnToAuto}
+                      disabled={
+                        actuatorLoading ||
+                        actuator.mode !== 'MANUAL'
+                      }
+                    >
+                      Return to AUTO
                     </button>
                   </div>
                 </div>

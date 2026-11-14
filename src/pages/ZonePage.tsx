@@ -59,7 +59,7 @@ interface ActuatorStateUpdate {
   desiredState?: boolean;
   desired_state?: boolean;
 
-  value?: number | boolean;
+  value?: number | boolean | null;
 
   controlMode?: string;
   control_mode?: string;
@@ -68,6 +68,20 @@ interface ActuatorStateUpdate {
   timestamp?: string;
   state_updated_at?: string;
 }
+
+// =========================
+// HELPERS
+// =========================
+
+const getActuatorMode = (
+  actuator: Actuator,
+): string => {
+  return (
+    actuator.reported_control_mode ??
+    actuator.control_mode ??
+    'UNKNOWN'
+  ).toUpperCase();
+};
 
 // =========================
 // COMPONENT
@@ -130,16 +144,44 @@ function ZonePage() {
   // FETCH FARM ACTUATORS
   // =========================
 
+  
+  // =========================
+  // FETCH + POLL FARM ACTUATORS
+  // FAN + LIGHT
+  // =========================
+
   useEffect(() => {
+    if (!farmId) return;
+
     let cancelled = false;
+    let isFetching = false;
 
     const fetchActuators = async () => {
-      try {
-        const response = await api.get('/bbb/actuators/state');
+      if (isFetching || cancelled) return;
 
-        const result = response.data?.data ?? response.data;
+      try {
+        isFetching = true;
+
+        const token = localStorage.getItem('accessToken');
+
+        if (!token) {
+          localStorage.removeItem('accessToken');
+          navigate('/login');
+          return;
+        }
+
+        const response = await api.get(
+          '/bbb/actuators/state',
+          {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          },
+        );
 
         if (cancelled) return;
+
+        const result = response.data?.data ?? response.data;
 
         const allActuators: Actuator[] =
           Array.isArray(result?.actuators)
@@ -149,19 +191,29 @@ function ZonePage() {
         const farmActuators = allActuators.filter(
           (item) =>
             Number(item.farm_id) === Number(farmId) &&
-            item.scope === 'farm' &&
+            item.scope?.toLowerCase() === 'farm' &&
             ['fan', 'light'].includes(item.actuator),
         );
 
         setActuators(farmActuators);
 
+        setActuatorError('');
+
         console.log(
-          '[FARM] Actuators loaded:',
-          farmActuators,
+          '[FARM POLLING] Actuators synchronized:',
+          farmActuators.map((item) => ({
+            esp32_id: item.esp32_id,
+            actuator: item.actuator,
+            actual_state: item.actual_state,
+            desired_state: item.desired_state,
+            control_mode:
+              item.reported_control_mode ??
+              item.control_mode,
+          })),
         );
       } catch (err: any) {
         console.error(
-          'Get farm actuator state error:',
+          '[FARM POLLING] Failed to synchronize actuators:',
           err,
         );
 
@@ -173,20 +225,29 @@ function ZonePage() {
 
         if (!cancelled) {
           setActuatorError(
-            'Unable to load farm device states.',
+            err.response?.data?.message ||
+              'Unable to synchronize farm actuator states.',
           );
         }
+      } finally {
+        isFetching = false;
       }
     };
 
-    if (farmId) {
+    // Fetch ngay khi mở trang
+    fetchActuators();
+
+    // Đồng bộ lại mỗi 3 giây
+    const pollingInterval = window.setInterval(() => {
       fetchActuators();
-    }
+    }, 3000);
 
     return () => {
       cancelled = true;
+      window.clearInterval(pollingInterval);
     };
   }, [farmId, navigate]);
+
 
   // =========================
   // WEBSOCKET
@@ -202,6 +263,10 @@ function ZonePage() {
 
     const socket = io(socketUrl, {
       transports: ['websocket'],
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
     });
 
     socket.on('connect', () => {
@@ -226,7 +291,6 @@ function ZonePage() {
           update,
         );
 
-        // Only handle FAN and LIGHT.
         if (!['fan', 'light'].includes(update.actuator)) {
           return;
         }
@@ -237,7 +301,6 @@ function ZonePage() {
         const updatedEsp32Id =
           update.esp32Id ?? update.esp32_id;
 
-        // Check farm identity when provided.
         if (
           updatedFarmId !== undefined &&
           Number(updatedFarmId) !== Number(farmId)
@@ -245,7 +308,6 @@ function ZonePage() {
           return;
         }
 
-        // Normalize actual state.
         let actualState: boolean | null | undefined;
 
         if (typeof update.actualState === 'boolean') {
@@ -263,7 +325,6 @@ function ZonePage() {
           actualState = Boolean(update.value);
         }
 
-        // Normalize desired state.
         const desiredState =
           typeof update.desiredState === 'boolean'
             ? update.desiredState
@@ -272,14 +333,17 @@ function ZonePage() {
               : undefined;
 
         const reportedMode =
+          update.reported_control_mode ??
           update.controlMode ??
-          update.control_mode ??
-          update.reported_control_mode;
+          update.control_mode;
 
-        // Do not update if no actual state is available.
-        if (actualState === undefined) {
+        if (
+          actualState === undefined &&
+          !reportedMode &&
+          desiredState === undefined
+        ) {
           console.warn(
-            '[FARM WS] No valid actual state:',
+            '[FARM WS] No valid actuator data:',
             update,
           );
           return;
@@ -315,7 +379,10 @@ function ZonePage() {
 
             return {
               ...item,
-              actual_state: actualState,
+              actual_state:
+                actualState === undefined
+                  ? item.actual_state
+                  : actualState,
               desired_state:
                 desiredState ?? item.desired_state,
               control_mode:
@@ -325,7 +392,7 @@ function ZonePage() {
               state_updated_at:
                 update.state_updated_at ??
                 update.timestamp ??
-                new Date().toISOString(),
+                item.state_updated_at,
             };
           });
         });
@@ -340,6 +407,7 @@ function ZonePage() {
           '[FARM WS] Device state processed:',
           update.actuator,
           actualState,
+          reportedMode,
         );
       },
     );
@@ -356,6 +424,7 @@ function ZonePage() {
 
   // =========================
   // CONTROL FARM ACTUATOR
+  // MANUAL ON / OFF
   // =========================
 
   const handleActuatorToggle = async (
@@ -393,6 +462,8 @@ function ZonePage() {
         {
           esp32_id: actuator.esp32_id,
           actuator: actuator.actuator,
+          action: 'SET_STATE',
+          mode: 'MANUAL',
           state: nextState,
         },
         {
@@ -403,12 +474,12 @@ function ZonePage() {
       );
 
       console.log(
-        '[FARM] Actuator command accepted:',
+        '[FARM] Manual actuator command accepted:',
         response.data,
       );
 
       setCommandMessage(
-        `Command sent to ${actuator.actuator}. Waiting for device feedback.`,
+        `Manual command sent to ${actuator.actuator}. Waiting for device feedback.`,
       );
     } catch (err: any) {
       console.error(
@@ -425,6 +496,75 @@ function ZonePage() {
       setActuatorError(
         err.response?.data?.message ||
           'Failed to send actuator command.',
+      );
+    } finally {
+      setActuatorLoading(false);
+    }
+  };
+
+  // =========================
+  // RETURN FARM ACTUATOR TO AUTO
+  // =========================
+
+  const handleActuatorReturnToAuto = async (
+    actuator: Actuator,
+  ) => {
+    if (actuatorLoading) return;
+
+    if (getActuatorMode(actuator) !== 'MANUAL') {
+      return;
+    }
+
+    try {
+      setActuatorLoading(true);
+      setActuatorError('');
+      setCommandMessage('');
+
+      const token = localStorage.getItem('accessToken');
+
+      if (!token) {
+        navigate('/login');
+        return;
+      }
+
+      const response = await api.post(
+        '/bbb/actuators/control',
+        {
+          esp32_id: actuator.esp32_id,
+          actuator: actuator.actuator,
+          action: 'RETURN_TO_AUTO',
+          mode: 'AUTO',
+        },
+        {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        },
+      );
+
+      console.log(
+        '[FARM] Return to AUTO accepted:',
+        response.data,
+      );
+
+      setCommandMessage(
+        `Return to AUTO request sent to ${actuator.actuator}. Waiting for BBB confirmation.`,
+      );
+    } catch (err: any) {
+      console.error(
+        '[FARM] Return to AUTO failed:',
+        err,
+      );
+
+      if (err.response?.status === 401) {
+        localStorage.removeItem('accessToken');
+        navigate('/login');
+        return;
+      }
+
+      setActuatorError(
+        err.response?.data?.message ||
+          `Failed to return ${actuator.actuator} to AUTO mode.`,
       );
     } finally {
       setActuatorLoading(false);
@@ -545,6 +685,10 @@ function ZonePage() {
                 actuator?.desired_state ??
                 false;
 
+              const currentMode = actuator
+                ? getActuatorMode(actuator)
+                : 'UNKNOWN';
+
               return (
                 <article
                   className="actuator-card"
@@ -597,28 +741,51 @@ function ZonePage() {
                   </div>
 
                   <div className="actuator-card-footer">
-                    <span className="actuator-mode auto">
-                      {actuator?.reported_control_mode?.toUpperCase() ??
-                        actuator?.control_mode?.toUpperCase() ??
-                        '--'}
+                    <span
+                      className={`actuator-mode ${
+                        currentMode === 'MANUAL'
+                          ? 'manual'
+                          : 'auto'
+                      }`}
+                    >
+                      {actuator ? currentMode : '--'}
                     </span>
 
-                    <button
-                      type="button"
-                      className="actuator-toggle-button"
-                      disabled={
-                        !actuator || actuatorLoading
-                      }
-                      onClick={() => {
-                        if (actuator) {
-                          handleActuatorToggle(actuator);
+                    <div className="actuator-actions">
+                      <button
+                        type="button"
+                        className="actuator-toggle-button"
+                        disabled={
+                          !actuator || actuatorLoading
                         }
-                      }}
-                    >
-                      <Power size={16} />
+                        onClick={() => {
+                          if (actuator) {
+                            handleActuatorToggle(actuator);
+                          }
+                        }}
+                      >
+                        <Power size={16} />
 
-                      Turn {currentState ? 'off' : 'on'}
-                    </button>
+                        Turn {currentState ? 'off' : 'on'}
+                      </button>
+
+                      <button
+                        type="button"
+                        className="actuator-auto-button"
+                        disabled={
+                          !actuator ||
+                          actuatorLoading ||
+                          currentMode !== 'MANUAL'
+                        }
+                        onClick={() => {
+                          if (actuator) {
+                            handleActuatorReturnToAuto(actuator);
+                          }
+                        }}
+                      >
+                        Return to AUTO
+                      </button>
+                    </div>
                   </div>
                 </article>
               );
